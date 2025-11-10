@@ -1,8 +1,10 @@
 from typing import Annotated
 
 import httpx
+import json
 from _datetime import datetime, timezone
 from app.dependencies import get_logger, get_provider_pricelist, get_transaction_context
+from app.policy_middleware import enforce_policy
 from fastapi import Depends, Request
 from fastapi.responses import StreamingResponse
 from lato import Application, TransactionContext
@@ -142,6 +144,35 @@ async def reverse_proxy(
 
     # Get the body as bytes for non-GET requests
     body = await request.body() if request.method != "GET" else None
+
+    # ===== IRONCLAD POLICY ENFORCEMENT (NEW) =====
+    # Parse request body for policy evaluation
+    request_body = {}
+    if body:
+        try:
+            request_body = json.loads(body.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("Failed to parse request body for policy enforcement")
+            request_body = {}
+
+    # Enforce IronClad security policies
+    allowed, modified_body, error_response = await enforce_policy(
+        request=request,
+        request_body=request_body,
+        project_slug=project_slug,
+        provider_slug=provider_slug
+    )
+
+    if not allowed:
+        # Request blocked by policy - return 403 error
+        logger.warning(f"Request blocked by IronClad policy: {project_slug}/{provider_slug}")
+        return error_response
+
+    if modified_body:
+        # Content was redacted - use modified body
+        logger.info(f"Request content redacted by IronClad policy")
+        body = json.dumps(modified_body).encode('utf-8')
+    # ===== END IRONCLAD POLICY ENFORCEMENT =====
 
     # Make the request to the upstream server
     client = httpx.AsyncClient()
