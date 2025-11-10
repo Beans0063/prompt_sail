@@ -368,6 +368,7 @@ class TransactionParamExtractor:
             "Azure Images Generations": r".*openai\.azure\.com.*images\/generations.*",
             "Azure Images Variations": r".*openai\.azure\.com.*images\/variations.*",
             "Azure Images Edits": r".*openai\.azure\.com.*images\/edits.*",
+            "OpenAI Responses": r".*api\.openai\.com.*\/responses.*",
             "OpenAI Chat Completions": r".*api\.openai\.com.*chat.*completions.*",
             "OpenAI Completions": r".*api\.openai\.com(?!.*chat).*\/completions.*",
             "OpenAI Embeddings": r".*api\.openai\.com.*embeddings.*",
@@ -961,6 +962,69 @@ class TransactionParamExtractor:
 
         return extracted
 
+    def _extract_from_openai_responses(self) -> dict:
+        """Extract transaction parameters from OpenAI Realtime/Responses API (SSE format)."""
+        extracted = {
+            "type": "realtime responses",
+            "provider": "OpenAI",
+        }
+
+        # Extract user messages from request input array
+        user_messages = []
+        if "input" in self.request_content:
+            for item in self.request_content["input"]:
+                if "role" in item and item["role"] == "user":
+                    # Handle content array format
+                    if "content" in item and isinstance(item["content"], list):
+                        for content_item in item["content"]:
+                            if content_item.get("type") == "input_text":
+                                user_messages.append(content_item.get("text", ""))
+
+        # Use the last user message as prompt
+        prompt = user_messages[-1] if user_messages else "No user message found"
+        extracted["prompt"] = prompt
+
+        # Build messages array from request
+        messages = []
+        if "input" in self.request_content:
+            for item in self.request_content["input"]:
+                role = item.get("role", "user")
+                if "content" in item:
+                    if isinstance(item["content"], list):
+                        # Extract text from content array
+                        text_parts = []
+                        for content_item in item["content"]:
+                            if content_item.get("type") == "input_text":
+                                text_parts.append(content_item.get("text", ""))
+                        content_text = " ".join(text_parts)
+                    else:
+                        content_text = str(item["content"])
+                    messages.append({"role": role, "content": content_text})
+
+        if self.response.__dict__["status_code"] > 200:
+            # Error handling
+            error_msg = self.response_content.get("error", {}).get("message", "Unknown error")
+            extracted["error_message"] = error_msg
+            extracted["last_message"] = error_msg
+            messages.append({"role": "error", "content": error_msg})
+        else:
+            # Extract model from response
+            extracted["model"] = self.request_content.get("model", "gpt-4o-realtime-preview")
+
+            # Extract assistant response text
+            if "text" in self.response_content:
+                last_message = self.response_content["text"]
+            elif "output" in self.response_content:
+                last_message = self.response_content.get("output", "")
+            else:
+                last_message = "[Realtime response - see full content in logs]"
+
+            extracted["last_message"] = last_message
+            messages.append({"role": "assistant", "content": last_message})
+
+        extracted["messages"] = messages
+        return extracted
+
     def _extract_from_openai_embeddings(self) -> dict:
         extracted = {"type": "embedding", "provider": "OpenAI"}
         messages = []
@@ -1189,6 +1253,8 @@ class TransactionParamExtractor:
             extracted = self._extract_from_azure_images_variations()
         if self.pattern == "Azure Images Edits":
             extracted = self._extract_from_azure_images_edit()
+        if self.pattern == "OpenAI Responses":
+            extracted = self._extract_from_openai_responses()
         if self.pattern == "OpenAI Chat Completions":
             extracted = self._extract_from_openai_chat_completions()
         if self.pattern == "OpenAI Completions":
@@ -2058,9 +2124,77 @@ def resize_b64_image(b64_image: str | str, new_size: tuple[int, int]) -> str:
 def preprocess_buffer(request, response, buffer) -> dict:
     decoder = response._get_content_decoder()
     buf = b"".join(buffer)
-    if "localhost" in str(request.__dict__["url"]) or "host.docker.internal" in str(
-        request.__dict__["url"]
-    ):
+    request_url = str(request.__dict__["url"])
+
+    # Check if this is an OpenAI Responses API (/v1/responses) request
+    if "/v1/responses" in request_url or "/responses" in request_url:
+        # Parse SSE format for OpenAI Realtime/Responses API
+        try:
+            decoded_buf = buf.decode("utf-8")
+            sse_events = []
+            current_event = {}
+
+            for line in decoded_buf.split("\n"):
+                line = line.strip()
+                if not line:
+                    if current_event:
+                        sse_events.append(current_event)
+                        current_event = {}
+                    continue
+
+                if line.startswith("event:"):
+                    current_event["event"] = line[6:].strip()
+                elif line.startswith("data:"):
+                    try:
+                        current_event["data"] = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        current_event["data"] = line[5:].strip()
+
+            # Extract response text from SSE events
+            response_text = []
+            model = "gpt-4o-realtime-preview"
+            usage_data = {}
+
+            for event in sse_events:
+                if event.get("event") == "response.output_text.delta":
+                    # Extract text delta from the event
+                    if "data" in event and isinstance(event["data"], dict):
+                        delta = event["data"].get("delta", "")
+                        if delta:
+                            response_text.append(delta)
+                elif event.get("event") == "response.done":
+                    # Extract final metadata
+                    if "data" in event and isinstance(event["data"], dict):
+                        response_data = event["data"].get("response", {})
+                        if "usage" in response_data:
+                            usage_data = response_data["usage"]
+                        if "model" in response_data:
+                            model = response_data["model"]
+
+            # Build response content structure
+            full_text = "".join(response_text)
+            response_content = {
+                "text": full_text,
+                "output": full_text,
+                "model": model,
+                "usage": {
+                    "prompt_tokens": usage_data.get("input_tokens", 0),
+                    "completion_tokens": usage_data.get("output_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens",
+                        usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0))
+                }
+            }
+
+        except Exception as e:
+            # Fallback if SSE parsing fails
+            response_content = {
+                "text": "[Response parsing error]",
+                "output": f"[Error parsing SSE response: {str(e)}]",
+                "model": "unknown",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
+
+    elif "localhost" in request_url or "host.docker.internal" in request_url:
         content = buf.decode("utf-8").split("\n")
         rest, content = content[-2], content[:-2]
         response_content = {
