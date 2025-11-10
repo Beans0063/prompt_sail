@@ -23,23 +23,24 @@ async def healthcheck(request: Request):
     return {"status": "OK", "datetime": datetime.now(tz=timezone.utc)}
 
 
-@app.api_route(
-    "/{path:path}",
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-)
-async def home_page(request: Request):
-    """
-    Handle unsupported traffic routes.
-
-    This endpoint serves as a catch-all route for any requests that don't match
-    other defined endpoints. It returns a basic response indicating the API is functioning.
-
-    Parameters:
-    - **request**: The incoming request object
-
-    Returns:
-    - A dictionary containing:
-      - status: Current API status ("OK")
-      - datetime: Current timestamp in UTC
-    """
-    return {"status": "OK", "datetime": datetime.now(tz=timezone.utc)}
+# Commented out to allow health router to work
+# @app.api_route(
+#     "/{path:path}",
+#     methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+# )
+# async def home_page(request: Request):
+#     """
+#     Handle unsupported traffic routes.
+#
+#     This endpoint serves as a catch-all route for any requests that don't match
+#     other defined endpoints. It returns a basic response indicating the API is functioning.
+#
+#     Parameters:
+#     - **request**: The incoming request object
+#
+#     Returns:
+#     - A dictionary containing:
+#       - status: Current API status ("OK")
+#       - datetime: Current timestamp in UTC
+#     """
+#     return {"status": "OK", "datetime": datetime.now(tz=timezone.utc)}
