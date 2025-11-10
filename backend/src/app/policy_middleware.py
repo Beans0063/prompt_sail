@@ -5,9 +5,9 @@ Integrates IronClad policy engine to enforce security policies
 before forwarding requests to LLM providers.
 """
 
-from typing import Optional
+from typing import Optional, Any
 from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import json
 import os
 import sys
@@ -18,8 +18,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../ironclad_po
 from ironclad_policies import PolicyEngine, PolicyDecision
 from ironclad_policies.content import ContentPolicy
 from ironclad_policies.content_lite import ContentPolicyLite
-from ironclad_policies.models import ContentFilterConfig, PolicyAction
-from ironclad_policies.config_manager import ConfigManager
+from ironclad_policies.models import ContentFilterConfig, PolicyAction, SensitiveDataType
 
 
 class PolicyEnforcer:
@@ -32,17 +31,12 @@ class PolicyEnforcer:
         Initialize policy enforcer.
 
         Args:
-            config_file: Path to YAML config (default: use env vars)
+            config_file: Path to YAML config (default: use env vars) - currently unused
         """
         self.engine = PolicyEngine()
 
-        # Load configuration
-        if config_file:
-            config_mgr = ConfigManager()
-            config = config_mgr.load_config(config_file)
-        else:
-            # Default config from environment
-            config = self._create_default_config()
+        # Create configuration from environment variables
+        config = self._create_default_config()
 
         # Add policy based on mode
         mode = os.getenv("IRONCLAD_MODE", "full")
@@ -61,6 +55,13 @@ class PolicyEnforcer:
 
     def _create_default_config(self) -> ContentFilterConfig:
         """Create default config from environment variables."""
+        # Configure action overrides for specific data types
+        action_overrides = {
+            SensitiveDataType.SSN: PolicyAction.BLOCK,  # Block SSNs
+            SensitiveDataType.EMAIL: PolicyAction.REDACT,  # Redact emails
+            SensitiveDataType.LOCATION: PolicyAction.WARN,  # Warn on locations
+        }
+
         return ContentFilterConfig(
             enabled=os.getenv("IRONCLAD_ENABLED", "true").lower() == "true",
             detect_pii=os.getenv("DETECT_PII", "true").lower() == "true",
@@ -68,6 +69,7 @@ class PolicyEnforcer:
             detect_pci=os.getenv("DETECT_PCI", "false").lower() == "true",
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.7")),
             default_action=PolicyAction(os.getenv("DEFAULT_ACTION", "warn")),
+            action_overrides=action_overrides,
         )
 
     async def evaluate_request(
@@ -93,9 +95,130 @@ class PolicyEnforcer:
 
         return decision
 
+    def create_friendly_block_response(self, decision: PolicyDecision, is_streaming: bool = False) -> JSONResponse | StreamingResponse:
+        """
+        Create user-friendly OpenAI-compatible response for blocked requests.
+
+        Instead of returning a 403 error, return a 200 OK with a friendly
+        assistant message explaining the policy violation.
+
+        Args:
+            decision: PolicyDecision that resulted in BLOCK
+            is_streaming: Whether to return a streaming response (SSE format)
+
+        Returns:
+            JSONResponse or StreamingResponse formatted as OpenAI chat completion
+        """
+        import time
+
+        # Create user-friendly message about what was detected
+        detected_types = []
+        for violation in decision.violations:
+            # Extract the type from the message (e.g., "Detected 1 instance(s) of ssn")
+            message = violation.message.lower()
+            if "ssn" in message:
+                detected_types.append("Social Security Number")
+            elif "email" in message:
+                detected_types.append("email address")
+            elif "credit" in message or "card" in message:
+                detected_types.append("credit card number")
+            elif "phone" in message:
+                detected_types.append("phone number")
+            elif "location" in message or "address" in message:
+                detected_types.append("location information")
+            else:
+                detected_types.append("sensitive information")
+
+        detected_str = ", ".join(detected_types) if detected_types else "sensitive information"
+
+        friendly_message = (
+            f"🔒 I'm sorry, but I cannot process your request because it contains {detected_str}. "
+            f"For your security and privacy, IronClad-AI policies prevent me from handling sensitive personal information.\n\n"
+            f"Please remove any sensitive data and try again. If you believe this is an error, "
+            f"please contact your system administrator."
+        )
+
+        response_id = f"chatcmpl-ironclad-block-{int(time.time())}"
+        created_time = int(time.time())
+
+        if is_streaming:
+            # Return streaming response in OpenAI Responses API SSE format
+            async def generate_stream():
+                msg_id = f"msg_{response_id}"
+
+                # Event 1: response.created
+                yield f"event: response.created\n"
+                yield f"data: {json.dumps({'type': 'response.created', 'sequence_number': 0, 'response': {'id': response_id, 'object': 'response', 'created_at': created_time, 'status': 'in_progress'}})}\n\n"
+
+                # Event 2: response.in_progress
+                yield f"event: response.in_progress\n"
+                yield f"data: {json.dumps({'type': 'response.in_progress', 'sequence_number': 1, 'response': {'id': response_id, 'object': 'response', 'created_at': created_time, 'status': 'in_progress'}})}\n\n"
+
+                # Event 3: response.output_item.added
+                yield f"event: response.output_item.added\n"
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'sequence_number': 2, 'output_index': 0, 'item': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': []}})}\n\n"
+
+                # Event 4: response.content_part.added
+                yield f"event: response.content_part.added\n"
+                yield f"data: {json.dumps({'type': 'response.content_part.added', 'sequence_number': 3, 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'text', 'text': ''}})}\n\n"
+
+                # Event 5: response.output_text.delta (with content)
+                yield f"event: response.output_text.delta\n"
+                yield f"data: {json.dumps({'type': 'response.output_text.delta', 'sequence_number': 4, 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': friendly_message})}\n\n"
+
+                # Event 6: response.content_part.done
+                yield f"event: response.content_part.done\n"
+                yield f"data: {json.dumps({'type': 'response.content_part.done', 'sequence_number': 5, 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'text', 'text': friendly_message}})}\n\n"
+
+                # Event 7: response.output_text.done
+                yield f"event: response.output_text.done\n"
+                yield f"data: {json.dumps({'type': 'response.output_text.done', 'sequence_number': 6, 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': friendly_message})}\n\n"
+
+                # Event 8: response.output_item.done
+                yield f"event: response.output_item.done\n"
+                yield f"data: {json.dumps({'type': 'response.output_item.done', 'sequence_number': 7, 'output_index': 0, 'item': {'id': msg_id, 'type': 'message', 'status': 'completed', 'content': [{'type': 'output_text', 'text': friendly_message}], 'role': 'assistant'}})}\n\n"
+
+                # Event 9: response.completed (KEY - not response.done!)
+                yield f"event: response.completed\n"
+                yield f"data: {json.dumps({'type': 'response.completed', 'sequence_number': 8, 'response': {'id': response_id, 'object': 'response', 'created_at': created_time, 'status': 'completed', 'status_details': None, 'output': [{'id': msg_id, 'type': 'message', 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': friendly_message}]}], 'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'input_tokens_details': {'cached_tokens': 0, 'text_tokens': 0, 'audio_tokens': 0, 'image_tokens': 0, 'cached_tokens_details': {'text_tokens': 0, 'audio_tokens': 0, 'image_tokens': 0}}, 'output_tokens_details': {'text_tokens': 0, 'audio_tokens': 0, 'reasoning_tokens': 0}}}})}\n\n"
+
+            return StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream",
+                status_code=200
+            )
+        else:
+            # Return non-streaming JSON response
+            response_body = {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": created_time,
+                "model": "ironclad-policy-enforcer",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": friendly_message,
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
+            }
+
+            return JSONResponse(
+                status_code=200,  # Return 200 so Onyx displays it as a normal message
+                content=response_body
+            )
+
     def create_error_response(self, decision: PolicyDecision) -> JSONResponse:
         """
         Create HTTP 403 error response for blocked requests.
+
+        DEPRECATED: Use create_friendly_block_response() instead for better UX.
 
         Args:
             decision: PolicyDecision that resulted in BLOCK
@@ -119,7 +242,7 @@ class PolicyEnforcer:
                 "type": "policy_violation",
                 "code": "IRONCLAD_POLICY_BLOCK",
                 "details": {
-                    "action": decision.action.value,
+                    "action": decision.action if isinstance(decision.action, str) else decision.action.value,
                     "violations": violations_summary,
                     "total_violations": len(decision.violations),
                     "help": "Please remove sensitive information and try again. "
@@ -152,7 +275,7 @@ async def enforce_policy(
     request_body: dict,
     project_slug: str,
     provider_slug: str
-) -> tuple[bool, Optional[dict], Optional[JSONResponse]]:
+) -> tuple[bool, Optional[dict], Optional[JSONResponse | Any]]:
     """
     Enforce policy on LLM request.
 
@@ -188,9 +311,11 @@ async def enforce_policy(
 
     # Handle decision
     if decision.action == PolicyAction.BLOCK:
-        # Return 403 error
-        error_response = enforcer.create_error_response(decision)
-        return False, None, error_response
+        # Return friendly user message (200 OK so it displays in chat)
+        # Check if client requested streaming
+        is_streaming = request_body.get("stream", False)
+        friendly_response = enforcer.create_friendly_block_response(decision, is_streaming=is_streaming)
+        return False, None, friendly_response
 
     elif decision.action == PolicyAction.REDACT:
         # Modify request body with redacted content
@@ -199,6 +324,23 @@ async def enforce_policy(
         # Replace content in messages (OpenAI format)
         if "messages" in modified_body and decision.modified_content:
             modified_body["messages"][-1]["content"] = decision.modified_content
+
+        # Replace content in input (Onyx/custom format)
+        if "input" in modified_body and decision.modified_content:
+            # Find the last user message in input array
+            for i in range(len(modified_body["input"]) - 1, -1, -1):
+                message = modified_body["input"][i]
+                if isinstance(message, dict) and "content" in message:
+                    content = message["content"]
+                    # Handle nested content structure
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and "text" in item:
+                                item["text"] = decision.modified_content
+                                break
+                    else:
+                        modified_body["input"][i]["content"] = decision.modified_content
+                    break
 
         # Replace prompt (Anthropic format)
         if "prompt" in modified_body and decision.modified_content:

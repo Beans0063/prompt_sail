@@ -151,6 +151,8 @@ async def reverse_proxy(
     if body:
         try:
             request_body = json.loads(body.decode('utf-8'))
+            logger.info(f"IronClad: Full request body keys: {list(request_body.keys())}")
+            logger.info(f"IronClad: Request body: {json.dumps(request_body)[:500]}")
         except (json.JSONDecodeError, UnicodeDecodeError):
             logger.warning("Failed to parse request body for policy enforcement")
             request_body = {}
@@ -162,6 +164,8 @@ async def reverse_proxy(
         project_slug=project_slug,
         provider_slug=provider_slug
     )
+
+    logger.info(f"IronClad: Policy decision - allowed={allowed}, modified={modified_body is not None}")
 
     if not allowed:
         # Request blocked by policy - return 403 error
@@ -179,12 +183,15 @@ async def reverse_proxy(
     # todo: copy timeout from request, temporary set to 100s
     timeout = httpx.Timeout(100.0, connect=50.0)
 
+    # Exclude content-length when body was modified (httpx will recalculate)
+    excluded_headers = ("host", "content-length") if modified_body else ("host",)
+
     request_time = datetime.now(tz=timezone.utc)
     ai_provider_request = client.build_request(
         method=request.method,
         url=url,
         headers={
-            k: v for k, v in request.headers.items() if k.lower() not in ("host",)
+            k: v for k, v in request.headers.items() if k.lower() not in excluded_headers
         },
         params=request.query_params,
         content=body,
@@ -194,8 +201,23 @@ async def reverse_proxy(
     ai_provider_response = await client.send(ai_provider_request, stream=True, follow_redirects=True)
 
     buffer = []
+
+    # Add logging for successful streaming responses
+    async def iterate_stream_with_logging(response, buffer):
+        chunk_count = 0
+        async for chunk in response.aiter_raw():
+            buffer.append(chunk)
+            chunk_count += 1
+            # Log all chunks to understand full format
+            try:
+                decoded = chunk.decode('utf-8')
+                logger.info(f"STREAM CHUNK {chunk_count}: {decoded[:300]}")
+            except:
+                logger.info(f"STREAM CHUNK {chunk_count}: [binary data]")
+            yield chunk
+
     return StreamingResponse(
-        iterate_stream(ai_provider_response, buffer),
+        iterate_stream_with_logging(ai_provider_response, buffer),
         status_code=ai_provider_response.status_code,
         headers=ai_provider_response.headers,
         background=BackgroundTask(
