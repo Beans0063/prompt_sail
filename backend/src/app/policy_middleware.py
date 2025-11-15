@@ -20,6 +20,13 @@ from ironclad_policies.content import ContentPolicy
 from ironclad_policies.content_lite import ContentPolicyLite
 from ironclad_policies.models import ContentFilterConfig, PolicyAction, SensitiveDataType
 
+# Try to import LLM Guard policy (optional dependency)
+try:
+    from ironclad_policies.llm_guard_policy import LLMGuardPolicy, LLM_GUARD_AVAILABLE
+except ImportError:
+    LLM_GUARD_AVAILABLE = False
+    LLMGuardPolicy = None
+
 
 class PolicyEnforcer:
     """
@@ -42,12 +49,35 @@ class PolicyEnforcer:
         mode = os.getenv("IRONCLAD_MODE", "full")
         if mode == "lite":
             policy = ContentPolicyLite(config=config)
+            self.engine.add_policy(policy)
             print("🚀 IronClad Policy Engine initialized (mode: LITE)")
         else:
-            policy = ContentPolicy(config=config)
-            print("🚀 IronClad Policy Engine initialized (mode: FULL)")
+            # FULL mode: Add ContentPolicy + LLMGuardPolicy (if available)
+            # Try ContentPolicy first, fall back to ContentPolicyLite if NLP fails
+            try:
+                content_policy = ContentPolicy(config=config)
+                self.engine.add_policy(content_policy)
+                print("   ✅ Content policy loaded (with NLP)")
+            except Exception as e:
+                print(f"   ⚠️  ContentPolicy failed ({str(e)[:100]}), using regex-only mode")
+                content_policy = ContentPolicyLite(config=config)
+                self.engine.add_policy(content_policy)
+                print("   ✅ Content policy loaded (regex-only)")
 
-        self.engine.add_policy(policy)
+            # Try to add LLM Guard policy for adversarial protection
+            if LLM_GUARD_AVAILABLE:
+                try:
+                    llm_guard_config = self._load_llm_guard_config()
+                    llm_guard_policy = LLMGuardPolicy(config=llm_guard_config)
+                    self.engine.add_policy(llm_guard_policy)
+                    print("🚀 IronClad Policy Engine initialized (mode: FULL)")
+                    print("   ✅ LLM Guard enabled (adversarial protection)")
+                except Exception as e:
+                    print(f"   ⚠️  LLM Guard initialization failed: {e}")
+                    print("   Continuing with Content-only protection")
+            else:
+                print("🚀 IronClad Policy Engine initialized (mode: FULL)")
+                print("   ⚠️  LLM Guard not available (install with: pip install llm-guard)")
 
         summary = self.engine.get_policy_summary()
         print(f"   Policies active: {summary['total_policies']}")
@@ -71,6 +101,45 @@ class PolicyEnforcer:
             default_action=PolicyAction(os.getenv("DEFAULT_ACTION", "warn")),
             action_overrides=action_overrides,
         )
+
+    def _load_llm_guard_config(self) -> dict:
+        """Load LLM Guard configuration from YAML file."""
+        import yaml
+
+        # Try to load from config file
+        config_path = os.getenv("LLM_GUARD_CONFIG", "/app/ironclad_policies/config/llm_guard.yaml")
+
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+                    return config.get('llm_guard', {})
+        except Exception as e:
+            print(f"   Warning: Could not load LLM Guard config from {config_path}: {e}")
+
+        # Return default minimal config
+        return {
+            "enabled": True,
+            "input_scanners": {
+                "prompt_injection": {
+                    "enabled": True,
+                    "threshold": 0.75,
+                    "use_onnx": True
+                },
+                "secrets": {
+                    "enabled": True,
+                    "redact_mode": "all"
+                },
+                "toxicity": {
+                    "enabled": True,
+                    "threshold": 0.7
+                },
+                "invisible_text": {
+                    "enabled": True
+                }
+            },
+            "output_scanners": {}
+        }
 
     async def evaluate_request(
         self,
