@@ -106,8 +106,16 @@ class PolicyEnforcer:
         """Load LLM Guard configuration from YAML file."""
         import yaml
 
-        # Try to load from config file
-        config_path = os.getenv("LLM_GUARD_CONFIG", "/app/ironclad_policies/config/llm_guard.yaml")
+        # Try to load from security profile or direct config path
+        security_profile = os.getenv("IRONCLAD_SECURITY_PROFILE", None)
+
+        if security_profile:
+            # Load from security_profiles directory
+            config_path = f"/app/ironclad_policies/config/security_profiles/{security_profile}.yaml"
+            print(f"   Loading LLM Guard config from security profile: {security_profile}")
+        else:
+            # Load from direct path
+            config_path = os.getenv("LLM_GUARD_CONFIG", "/app/ironclad_policies/config/llm_guard.yaml")
 
         try:
             if os.path.exists(config_path):
