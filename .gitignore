@@ -169,3 +169,7 @@ backend/poetry.lock
 private_examples/*
 docker-compose-wk.yml
 examples/poetry.lock
+
+# Claude Flow/Swarm runtime artifacts
+.claude-flow/
+.swarm/
