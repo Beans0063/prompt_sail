@@ -1939,18 +1939,56 @@ class ApiURLBuilder:
             for prov in project.ai_providers
             if prov.slug == deployment_slug
         ][0]
-        if path == "":
-            path = unquote(unquote(target_path)) if target_path is not None else ""
-            if len(path.split("/")[1:]) > 5:
-                new_path = path.split("/")[1:]
-                new_path = new_path[0:3] + new_path[5:7]
-                path = "/" + "/".join(new_path)
 
-        url = api_base + f"/{path}".replace("//", "/")
-        print("URL", url)
+        # Parse the path to extract the actual API endpoint
+        # URL structure: /api/{project}/{provider}/{deployment}/{endpoint}
+        # For example: /api/ironclad-demo/mock-openai/production/v1/responses
+        # - deployment = "production" (this becomes deployment_slug, already extracted)
+        # - endpoint = "v1/responses" (this is what we want)
 
+        if target_path:
+            # target_path explicitly provided (e.g., from query parameter)
+            actual_path = unquote(unquote(target_path))
+        elif path == "":
+            actual_path = ""
+        else:
+            # Path comes from the URL route: {deployment}/{endpoint}
+            # For example: "production/v1/responses"
+            # We need to extract everything AFTER the first component (deployment name)
+            path_parts = path.split("/", 1)  # Split only on first "/"
+            if len(path_parts) > 1:
+                # path_parts[0] is deployment name (e.g., "production")
+                # path_parts[1] is the API endpoint (e.g., "v1/responses")
+                actual_path = path_parts[1]
+            else:
+                # No slash in path, use it as-is for legacy support
+                actual_path = path
+
+        # Build URL: api_base + actual_path
         if api_base.endswith("/"):
-            url = api_base + f"{path}".replace("//", "/")
+            url = api_base + actual_path.lstrip("/")
+        else:
+            url = api_base + "/" + actual_path.lstrip("/")
+
+        # Clean up any double slashes (but preserve protocol://)
+        url = url.replace("//", "/").replace(":/", "://")
+
+        # Handle duplicate path components (e.g., /v1/v1/responses -> /v1/responses)
+        # This happens when api_base ends with /v1 and actual_path starts with v1/
+        # Example: api_base="http://mock-llm:8000/v1" + actual_path="v1/responses"
+        #          results in "http://mock-llm:8000/v1/v1/responses"
+        # We need to detect and fix this duplication
+        parts = url.split("://", 1)
+        if len(parts) == 2:
+            protocol, path_part = parts
+            # Split path into segments
+            segments = path_part.split("/")
+            # Remove consecutive duplicate segments
+            deduped = [segments[0]]  # Keep the hostname
+            for i in range(1, len(segments)):
+                if segments[i] != segments[i-1] or segments[i] == "":
+                    deduped.append(segments[i])
+            url = protocol + "://" + "/".join(deduped)
 
         print("URL", url)
         return url

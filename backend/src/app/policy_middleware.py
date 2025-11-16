@@ -88,7 +88,7 @@ class PolicyEnforcer:
         # Configure action overrides for specific data types
         action_overrides = {
             SensitiveDataType.SSN: PolicyAction.BLOCK,  # Block SSNs
-            SensitiveDataType.EMAIL: PolicyAction.REDACT,  # Redact emails
+            SensitiveDataType.EMAIL: PolicyAction.ALLOW,  # Let LLM Guard handle emails with vault
             SensitiveDataType.LOCATION: PolicyAction.WARN,  # Warn on locations
         }
 
@@ -167,6 +167,32 @@ class PolicyEnforcer:
         # Evaluate using engine's built-in request parsing
         decision = await self.engine.evaluate_request_body(
             request_body=request_body,
+            metadata=metadata
+        )
+
+        return decision
+
+    async def evaluate_output(
+        self,
+        prompt: str,
+        output: str,
+        metadata: Optional[dict] = None
+    ) -> PolicyDecision:
+        """
+        Evaluate LLM output against policies.
+
+        Args:
+            prompt: Original user prompt
+            output: LLM generated response
+            metadata: Additional context
+
+        Returns:
+            PolicyDecision with allowed/blocked status
+        """
+        # Evaluate using engine's output evaluation
+        decision = await self.engine.evaluate_output(
+            prompt=prompt,
+            output=output,
             metadata=metadata
         )
 
@@ -402,22 +428,29 @@ async def enforce_policy(
         if "messages" in modified_body and decision.modified_content:
             modified_body["messages"][-1]["content"] = decision.modified_content
 
-        # Replace content in input (Onyx/custom format)
+        # Replace content in input (OpenAI Responses API and Onyx/custom format)
         if "input" in modified_body and decision.modified_content:
-            # Find the last user message in input array
-            for i in range(len(modified_body["input"]) - 1, -1, -1):
-                message = modified_body["input"][i]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-                    # Handle nested content structure
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and "text" in item:
-                                item["text"] = decision.modified_content
-                                break
-                    else:
-                        modified_body["input"][i]["content"] = decision.modified_content
-                    break
+            input_data = modified_body["input"]
+
+            # Handle simple string input (OpenAI Responses API format)
+            if isinstance(input_data, str):
+                modified_body["input"] = decision.modified_content
+            # Handle array of messages (Onyx/custom format)
+            elif isinstance(input_data, list):
+                # Find the last user message in input array
+                for i in range(len(input_data) - 1, -1, -1):
+                    message = input_data[i]
+                    if isinstance(message, dict) and "content" in message:
+                        content = message["content"]
+                        # Handle nested content structure
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and "text" in item:
+                                    item["text"] = decision.modified_content
+                                    break
+                        else:
+                            modified_body["input"][i]["content"] = decision.modified_content
+                        break
 
         # Replace prompt (Anthropic format)
         if "prompt" in modified_body and decision.modified_content:
@@ -428,3 +461,91 @@ async def enforce_policy(
     else:
         # ALLOW or WARN - proceed unchanged
         return True, None, None
+
+
+async def enforce_output_policy(
+    prompt: str,
+    output: str,
+    metadata: Optional[dict] = None,
+    is_streaming: bool = False
+) -> tuple[bool, Optional[str]]:
+    """
+    Enforce policy on LLM output.
+
+    Args:
+        prompt: Original user prompt
+        output: LLM generated response
+        metadata: Additional context
+        is_streaming: Whether this is a streaming response
+
+    Returns:
+        Tuple of (allowed, replacement_output)
+        - allowed: True if output should be returned to user
+        - replacement_output: Modified output or block message if blocked
+    """
+    # Check if policies are enabled
+    if os.getenv("IRONCLAD_ENABLED", "true").lower() != "true":
+        return True, None
+
+    # Get enforcer
+    enforcer = get_policy_enforcer()
+
+    # Evaluate output
+    decision = await enforcer.evaluate_output(
+        prompt=prompt,
+        output=output,
+        metadata=metadata
+    )
+
+    # Handle decision
+    if decision.action == PolicyAction.BLOCK:
+        # Return friendly block message
+        friendly_response = enforcer.create_friendly_block_response(decision, is_streaming=is_streaming)
+
+        # Extract content from the response
+        if is_streaming:
+            # For streaming, we can't easily use StreamingResponse here
+            # Instead, return a simple message
+            block_message = (
+                "🔒 This response was blocked by IronClad security policies because it contains sensitive or unsafe content. "
+                "The detected issues include: "
+            )
+            detected_scanners = []
+            for violation in decision.violations:
+                if hasattr(violation, 'scanner'):
+                    detected_scanners.append(violation.scanner)
+                elif hasattr(violation, 'policy_type'):
+                    detected_scanners.append(violation.policy_type)
+
+            if detected_scanners:
+                block_message += ", ".join(set(detected_scanners))
+            else:
+                block_message += "security violations"
+
+            block_message += ". Please contact your system administrator if you believe this is an error."
+
+            return False, block_message
+        else:
+            # For non-streaming, extract the message content
+            if isinstance(friendly_response, JSONResponse):
+                import json
+                # Parse the JSON body to get the content
+                body = json.loads(friendly_response.body.decode())
+                if "choices" in body and len(body["choices"]) > 0:
+                    message_content = body["choices"][0].get("message", {}).get("content", "Response blocked by security policy")
+                    return False, message_content
+
+            # Fallback message
+            return False, "🔒 Response blocked by IronClad security policy."
+
+    elif decision.action == PolicyAction.REDACT:
+        # Return modified output
+        if decision.modified_content:
+            return True, decision.modified_content
+        else:
+            # No modification available, allow original
+            return True, None
+
+    else:
+        # ALLOW or WARN - proceed unchanged
+        return True, None
